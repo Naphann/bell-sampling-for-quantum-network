@@ -1,2 +1,3 @@
-# bell-sampling-for-quantum-network
+# Bell Sampling for Quantum Networks
+
 simulation of Bell-sampling protocols for estimating diagonal elements graph states distributed in the quantum network settings
