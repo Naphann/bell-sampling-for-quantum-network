@@ -7,7 +7,7 @@ import numpy as np
 import stim
 from sympy import fwht
 
-from graph_state.array_helper import probabilistic_select_rows
+from graph_state.array_helper import probabilistic_select_rows, constructive_grouping
 
 
 def _validate_fidelity(fidelity: float):
@@ -176,23 +176,23 @@ class GraphState:
         if fidelity < 0 or fidelity > 1:
             raise ValueError(f"Fidelity must be between 0 and 1 (given {fidelity})")
         circuit = stim.Circuit()
-        
+
         if fidelity == 1 or error_model == "no-error":
             return circuit
-        
+
         if error_model == "single-qubit-dephasing":
             p = 1 - (fidelity ** (1.0 / self.n))
             return stim.Circuit(f'Z_ERROR({p}) {" ".join(map(str, range(offset, offset + self.n)))}')
-        
+
         if error_model == 'fully-dephased':
             return stim.Circuit(f'Z_ERROR({0.5}) {" ".join(map(str, range(offset, offset + self.n)))}')
-        
+
         if error_model == "bimodal":
             p = 1 - fidelity
             return stim.Circuit(f"Z_ERROR({p}) {offset}")
-        
+
         raise RuntimeError("reaching end of noise circuit generation without getting valid noise circuit.")
-    
+
     def get_bell_sampling_circuit(self) -> stim.Circuit:
         sampling_circuit = stim.Circuit(
             f"""
@@ -205,7 +205,7 @@ class GraphState:
         """
         )
         return sampling_circuit
-    
+
     def get_partial_tomo_measurement_circuit(self) -> stim.Circuit:
         stim_pauli_prods = []
         for st in self.stab_generators:
@@ -425,13 +425,295 @@ def _post_process_partial_tomo_generator_samples_to_all_stabilizers(g: GraphStat
 
     return prob_plus_one
 
+
+def _post_process_dge_for_complete_graph_overlap(g: GraphState, samples):
+    """postprocess dge for complete graph state with non-overlapping stabilizer observables"""
+    # since samples are bitpacked (little-endian) we count the chunks instead of the number of qubits
+    shots, num_measurement_chunks = samples.shape
+    N = 2**g.n
+    num_groups = (
+        N // 2 + 1
+    )  # note here that we have N/2 (odd product of generators) + 1 (all even; i.e., all Ys)
+
+    if g.n > 64:
+        raise ValueError(f"n={g.n} is too large for this optimized function (max 64).")
+    if num_groups > shots:
+        raise ValueError(
+            f"Not enough shots to split between all stabilizers (shots given: {shots}; total circuits to run {num_groups})"
+        )
+
+    all_indices = np.arange(N, dtype=np.uint64)  # array of length N
+    all_bit_counts = np.bitwise_count(
+        all_indices
+    )  # precompute the parity of bitstrings
+    all_numbers_bitpacked = np.array(
+        [
+            list(i.to_bytes(num_measurement_chunks, byteorder="little", signed=False))
+            for i in range(N)
+        ],
+        dtype=np.uint8,
+    )
+
+    # Filter odd/even
+    odd_mask = (all_bit_counts % 2) == 1
+    odd_indices = all_indices[odd_mask]
+    bitpacked_odd = all_numbers_bitpacked[odd_mask]
+
+    even_mask = ((all_bit_counts % 2) == 0) & (all_indices != 0)  # we don't want 0
+    even_indices = all_indices[even_mask]
+    bitpacked_even = all_numbers_bitpacked[even_mask]
+
+    # assign how many shots to each group
+    sample_sizes = np.full(num_groups, shots // num_groups, dtype=int)
+    left_over_shots = shots % num_groups
+    rng = np.random.default_rng()
+    lucky_stabilizers = rng.choice(
+        num_groups, left_over_shots, replace=False
+    )  # we don't add to the same group twice
+    sample_sizes[lucky_stabilizers] += 1
+
+    # 1. Split the samples into groups based on sample_sizes
+    split_indices = np.cumsum(sample_sizes)[:-1]
+    sample_groups = np.split(samples, split_indices, axis=0)
+    all_parities_list = []
+
+    # 2. Process the first (num_groups - 1) groups against the odd stabilizers
+    for i in range(num_groups - 1):
+        group_samples = sample_groups[i]
+        stabilizer = bitpacked_odd[i]
+
+        # we perform bitwise_and to see post-process the generator into stabilizer measurement
+        # i.g., if stabilizer we want is g1.g4.g5 = 10011 we bitwise_and with the measurement result
+        # and compute the measurement result as 0/1 by looking at the even/odd parity
+        bitwise_and_result = group_samples & stabilizer
+        total_bit_counts_per_sample = np.bitwise_count(bitwise_and_result).sum(axis=1)
+        parities = (total_bit_counts_per_sample % 2).astype(np.int8)
+
+        all_parities_list.append(parities)
+
+    # 3. Process the last group against all *even* stabilizers
+    last_group_samples = sample_groups[-1]
+
+    # We want to compute (s & g) for all samples s in the last group
+    # and all stabilizers g in the even list.
+    s_broadcast = last_group_samples[:, np.newaxis, :]
+    g_broadcast = bitpacked_even[np.newaxis, :, :]
+
+    bitwise_and_result = s_broadcast & g_broadcast
+
+    # Sum bit counts over the C dimension (chunks)
+    total_bit_counts = np.bitwise_count(bitwise_and_result).sum(axis=2)  # Shape (M, K)
+
+    # Compute the parities
+    parities_last_group = (total_bit_counts % 2).astype(np.int8)
+    all_parities_list.append(parities_last_group)
+
+    # 4. (a) Process odd stabilizer groups (first N//2)
+    exp_vals_odd = np.array(
+        [np.mean(parities * -2 + 1) for parities in all_parities_list[:-1]], dtype=float
+    )
+    #    (b) Process even stabilizer group (last one)
+    parities_last_group = all_parities_list[-1]  # Shape (M, K)
+    eigenvalues_last_group = parities_last_group * -2 + 1  # Shape (M, K)
+    exp_vals_even = np.mean(eigenvalues_last_group, axis=0)  # Shape (K,)
+
+    # 6. Create final ordered 1D array of size (N-1)
+    # Use advanced indexing (scatter) to build the final array.
+    final_expectation_values = np.full(N - 1, np.nan, dtype=float)
+
+    # we need -1 because array is 0-indexed (for stabilizers 1 to N-1)
+    final_expectation_values[odd_indices - 1] = exp_vals_odd
+    final_expectation_values[even_indices - 1] = exp_vals_even
+
+    return final_expectation_values
+
+
+def _post_process_dge_for_complete_graph_non_overlap(g: GraphState, samples):
+    """
+    New version of post-processing where even stabilizers are further
+    grouped into bitwise-disjoint sets.
+    """
+    # since samples are bitpacked (little-endian) we count the chunks instead of the number of qubits
+    shots, num_measurement_chunks = samples.shape
+    N = 2**g.n
+
+    if g.n > 64:
+        raise ValueError(f"n={g.n} is too large for this optimized function (max 64).")
+
+    all_indices = np.arange(N, dtype=np.uint64)  # array of length N
+    all_bit_counts = np.bitwise_count(
+        all_indices
+    )  # precompute the parity of bitstrings
+    all_numbers_bitpacked = np.array(
+        [
+            list(i.to_bytes(num_measurement_chunks, byteorder="little", signed=False))
+            for i in range(N)
+        ],
+        dtype=np.uint8,
+    )
+
+    # Odd stabilizers
+    odd_mask = (all_bit_counts % 2) == 1
+    odd_indices = all_indices[odd_mask]
+    bitpacked_odds = all_numbers_bitpacked[odd_mask]  # Shape (N//2, C)
+
+    # Even stabilizers
+    even_mask = ((all_bit_counts % 2) == 0) & (all_indices != 0)
+    even_indices = all_indices[even_mask]
+    bitpacked_evens = all_numbers_bitpacked[even_mask]  # Shape (K, C)
+
+    # We need a way to group without non-overlap stabilizer elements
+    even_groups_indices = constructive_grouping(even_indices, g.n)
+    num_even_groups = len(even_groups_indices)
+    # Create a lookup map for index -> bitpacked array
+    bitpacked_even_map = {idx: arr for idx, arr in zip(even_indices, bitpacked_evens)}
+
+    # Total number of groups is odd groups + new even groups
+    num_odd_groups = N // 2
+    num_groups = num_odd_groups + num_even_groups
+
+    # validation
+    if num_groups > shots:
+        raise ValueError(
+            f"Not enough shots to split between all stabilizers (shots given: {shots}; total circuits to run {num_groups})"
+        )
+
+    sample_sizes = np.full(num_groups, shots // num_groups, dtype=int)
+    left_over_shots = shots % num_groups
+
+    rng = np.random.default_rng()
+    lucky_stabilizers = rng.choice(num_groups, left_over_shots, replace=False)
+    sample_sizes[lucky_stabilizers] += 1
+
+    # 1. Split the samples into groups
+    split_indices = np.cumsum(sample_sizes)[:-1]
+    sample_groups = np.split(samples, split_indices, axis=0)
+
+    all_parities_list = []
+
+    # 2. Process the odd stabilizer groups
+    for i in range(num_odd_groups):
+        group_samples = sample_groups[i]
+
+        if group_samples.shape[0] == 0:
+            all_parities_list.append(np.array([], dtype=np.int8))
+            continue
+
+        stabilizer = bitpacked_odds[i]
+        bitwise_and_result = group_samples & stabilizer
+        total_bit_counts_per_sample = np.bitwise_count(bitwise_and_result).sum(axis=1)
+        parities = (total_bit_counts_per_sample % 2).astype(np.int8)
+        all_parities_list.append(parities)
+
+    # 3. Process the even stabilizer groups (non-overlapped)
+    for k in range(num_even_groups):
+        current_samples = sample_groups[
+            num_odd_groups + k
+        ]  # Get the k-th even sample group
+        current_group_indices = even_groups_indices[k]
+
+        # Build the (K_k, C) stabilizer array for this group
+        current_stabilizers_bitpacked = np.array(
+            [bitpacked_even_map[idx] for idx in current_group_indices]
+        )
+
+        # Broadcast samples (M_k, C) against stabilizers (K_k, C)
+        s_broadcast = current_samples[:, np.newaxis, :]  # Shape (M_k, 1, C)
+        g_broadcast = current_stabilizers_bitpacked[
+            np.newaxis, :, :
+        ]  # Shape (1, K_k, C)
+
+        bitwise_and_result = s_broadcast & g_broadcast  # Shape (M_k, K_k, C)
+
+        total_bit_counts = np.bitwise_count(bitwise_and_result).sum(
+            axis=2
+        )  # Shape (M_k, K_k)
+        parities_group = (total_bit_counts % 2).astype(np.int8)
+
+        all_parities_list.append(parities_group)
+
+    final_expectation_values = np.full(N - 1, np.nan, dtype=float)
+
+    # 4. (a) Process odd stabilizer groups
+    exp_vals_odd = np.array(
+        [np.mean(parities * -2 + 1) for parities in all_parities_list[:num_odd_groups]],
+        dtype=float,
+    )
+
+    final_expectation_values[odd_indices - 1] = exp_vals_odd
+
+    #    (b) Process even stabilizer groups (non-overlap)
+    for k in range(num_even_groups):
+        parities_k = all_parities_list[
+            num_odd_groups + k
+        ]  # Get k-th even parity result
+        indices_k = even_groups_indices[k]
+
+        eigenvalues_k = parities_k * -2 + 1  # Shape (M_k, K_k)
+        exp_vals_k = np.mean(eigenvalues_k, axis=0)  # Shape (K_k,)
+        # Scatter these values into the final array
+        final_expectation_values[np.array(indices_k) - 1] = exp_vals_k
+
+    return final_expectation_values
+
+
+def dge_combined(
+    g: GraphState,
+    error_model: str,
+    fidelity: float,
+    shots: int,
+    overlap_observables: bool,
+):
+    """steps to perform DGE specific to ONLY complete-graph graph states
+    (to get expectation values over all obsevables defined from stabilizer elements).
+    1. create the circuit of graph state.
+    2. add noise according to the given noise model and fidelity
+    3. add stabilizer generator measurement parts (we get n measurements each run)
+    4. transform these n measurements to expectation values over all observables defined from stabilizer elements.
+    5. return results.
+    """
+    if g.type != "complete":
+        raise ValueError("currently this version of DGE only supports complete graphs.")
+    _validate_error_model(error_model)
+    _validate_fidelity(fidelity)
+
+    if error_model != "depolarizing":
+        circuit = g.get_graph_state_circuit(0)
+        circuit += g.get_noise_circuit(fidelity, error_model, 0)
+        circuit += g.get_partial_tomo_measurement_circuit()
+        samples = circuit.compile_sampler().sample_bit_packed(shots)
+    else:
+        base_circ = g.get_graph_state_circuit(0)
+        meas_circ = g.get_partial_tomo_measurement_circuit()
+
+        circ_1 = base_circ + meas_circ
+        circ_2 = (
+            base_circ + g.get_noise_circuit(fidelity, "fully-dephased", 0) + meas_circ
+        )
+
+        samples_1 = circ_1.compile_sampler().sample_bit_packed(shots)
+        samples_2 = circ_2.compile_sampler().sample_bit_packed(shots)
+
+        N = 2**g.n
+        p = fidelity - (1 - fidelity) / (N - 1)
+
+        mask = np.random.rand(shots) < p
+        mask_reshaped = mask[:, np.newaxis]
+        samples = np.where(mask_reshaped, samples_1, samples_2)
+
+    if overlap_observables:
+        return _post_process_dge_for_complete_graph_overlap(g, samples)
+    else:
+        return _post_process_dge_for_complete_graph_non_overlap(g, samples)
+
+
 def partial_tomo(g: GraphState, error_model: str, fidelity: float, shots: int):
     """steps to perform partial tomo (to get expectation values over all obsevables defined from stabilizer elements).
-        1. create the circuit of graph state.
-        2. add noise according to the given noise model and fidelity
-        3. add stabilizer generator measurement parts (we get n measurements each run)
-        4. transform these n measurements to expectation values over all observables defined from stabilizer elements.
-        5. return results.
+    1. create the circuit of graph state.
+    2. add noise according to the given noise model and fidelity
+    3. add stabilizer generator measurement parts (we get n measurements each run)
+    4. transform these n measurements to expectation values over all observables defined from stabilizer elements.
+    5. return results.
     """
     # TODO: write the output format of the samples
     _validate_error_model(error_model)
@@ -443,8 +725,10 @@ def partial_tomo(g: GraphState, error_model: str, fidelity: float, shots: int):
         circuit += g.get_partial_tomo_measurement_circuit()
 
         samples = circuit.compile_sampler().sample_bit_packed(shots)
-        return _post_process_partial_tomo_generator_samples_to_all_stabilizers(g, samples)
-    
+        return _post_process_partial_tomo_generator_samples_to_all_stabilizers(
+            g, samples
+        )
+
     """error model must be depolarizing, we need to build 4 circuits:
     1. no error/no error
     2. no error/fully dephased
@@ -456,12 +740,12 @@ def partial_tomo(g: GraphState, error_model: str, fidelity: float, shots: int):
     meas_circ = g.get_partial_tomo_measurement_circuit()
 
     circ_1 = base_circ + meas_circ
-    circ_2 = base_circ + g.get_noise_circuit(fidelity, 'fully-dephased', 0) + meas_circ
+    circ_2 = base_circ + g.get_noise_circuit(fidelity, "fully-dephased", 0) + meas_circ
 
     samples_1 = circ_1.compile_sampler().sample_bit_packed(shots)
     samples_2 = circ_2.compile_sampler().sample_bit_packed(shots)
 
-    N = 2 ** g.n
+    N = 2**g.n
     p = fidelity - (1 - fidelity) / (N - 1)
 
     mask = np.random.rand(shots) < p
@@ -470,15 +754,16 @@ def partial_tomo(g: GraphState, error_model: str, fidelity: float, shots: int):
 
     return _post_process_partial_tomo_generator_samples_to_all_stabilizers(g, samples)
 
+
 def get_diagonals_from_all_stabilizer_observables(g: GraphState, expvals):
-    N_fwhm = 1 << g.n # 2**n_qubits, size of the FWHT vector
-        
+    N_fwhm = 1 << g.n  # 2**n_qubits, size of the FWHT vector
+
     # Create the input vector for FWHT of size N_fwhm
     fwht_input = np.zeros(N_fwhm, dtype=float)
 
     # Get the integer indices corresponding to the stabilizers in 'exps'
     # These indices are assumed to be 1, 2, ..., N_fwhm-1 if exps covers all non-identity Paulis
-    stabilizer_integer_indices = np.arange(1, 2 ** g.n)
+    stabilizer_integer_indices = np.arange(1, 2**g.n)
     # sqrt_exps_safe = np.sqrt(np.maximum(0, expvals))
 
     # Populate fwht_input:
@@ -486,12 +771,12 @@ def get_diagonals_from_all_stabilizer_observables(g: GraphState, expvals):
     # fwht_input[s] = sqrt(expectation_value_of_stabilizer_s)
     fwht_input[stabilizer_integer_indices] = expvals
     fwht_input[0] = 1.0
-    
+
     # Calculate the Fast Walsh-Hadamard Transform
     # The result 'transformed_coeffs[i]' = sum_s (fwht_input[s] * (-1)**<i,s>)
     # where <i,s> is the bitwise dot product (popcount(i&s) % 2)
     transformed_coeffs = np.array(fwht(fwht_input), dtype=float)
-    
+
     # Calculate the final diagonal values
     # diagonals = (1.0 + transformed_coeffs) / N_fwhm
     diagonals = transformed_coeffs / N_fwhm
