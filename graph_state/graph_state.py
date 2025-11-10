@@ -10,6 +10,23 @@ from sympy import fwht
 from graph_state.array_helper import probabilistic_select_rows
 
 
+def _validate_fidelity(fidelity: float):
+    if fidelity < 0 or fidelity > 1:
+        raise ValueError(f"Fidelity must be between 0 and 1 (given {fidelity})")
+    return
+
+
+def _validate_error_model(error_model: str):
+    if error_model not in [
+        "no-error",
+        "depolarizing",
+        "single-qubit-dephasing",
+        "bimodal",
+    ]:
+        raise ValueError(f"unknown error_model (given {error_model})")
+    return
+
+
 class GraphState:
 
     def __init__(self, n: int, graph_type="complete", edges: list[tuple[int, int]] = None):
@@ -259,15 +276,8 @@ def bell_sampling(g: GraphState, error_model: str, fidelity: float, shots: int):
         3. generate samples and return.
     """
     # TODO: write the output format of the samples
-    if error_model not in [
-            "no-error",
-            "depolarizing",
-            "single-qubit-dephasing",
-            "bimodal",
-        ]:
-        raise ValueError(f"unknown error_model (given {error_model})")
-    if fidelity < 0 or fidelity > 1:
-        raise ValueError(f"Fidelity must be between 0 and 1 (given {fidelity})")
+    _validate_error_model(error_model)
+    _validate_fidelity(fidelity)
     
     if error_model != "depolarizing":
         circuit = g.get_graph_state_circuit(0) + g.get_graph_state_circuit(g.n)
@@ -424,15 +434,8 @@ def partial_tomo(g: GraphState, error_model: str, fidelity: float, shots: int):
         5. return results.
     """
     # TODO: write the output format of the samples
-    if error_model not in [
-            "no-error",
-            "depolarizing",
-            "single-qubit-dephasing",
-            "bimodal",
-        ]:
-        raise ValueError(f"unknown error_model (given {error_model})")
-    if fidelity < 0 or fidelity > 1:
-        raise ValueError(f"Fidelity must be between 0 and 1 (given {fidelity})")
+    _validate_error_model(error_model)
+    _validate_fidelity(fidelity)
 
     if error_model != "depolarizing":
         circuit = g.get_graph_state_circuit(0)
