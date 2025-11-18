@@ -137,13 +137,14 @@ class GraphState:
                 ]
             ).reshape(self.n * 3)
 
-    def sample_int_stabilizers(self, shots: int):
+    def sample_int_stabilizers(self, shots: int, seed: int = None):
         """
         xx = int_paulis == 2
         zz = int_paulis == 1
         yy = int_paulis == 3
         """
-        stabilizers = np.random.rand(shots, self.n) > 0.5
+        rng = np.random.default_rng(seed=seed)
+        stabilizers = rng.rand(shots, self.n) > 0.5
         return np.array(
             [
                 [
@@ -269,7 +270,7 @@ def expectation_value_of_observables_bitpacked(
     return max((n - 2.0 * np.sum(gn(measurement_results))) / n, 0)
 
 
-def bell_sampling(g: GraphState, error_model: str, fidelity: float, shots: int):
+def bell_sampling(g: GraphState, error_model: str, fidelity: float, shots: int, seed: int = None):
     """steps to perform Bell samping.
         1. create the circuit of graph state.
         2. add noise according to the given noise model and fidelity
@@ -284,7 +285,7 @@ def bell_sampling(g: GraphState, error_model: str, fidelity: float, shots: int):
         circuit += g.get_noise_circuit(fidelity, error_model, 0) + g.get_noise_circuit(fidelity, error_model, g.n)
         circuit += g.get_bell_sampling_circuit()
         # return circuit
-        return circuit.compile_sampler().sample_bit_packed(shots)
+        return circuit.compile_sampler(seed=seed).sample_bit_packed(shots)
     
     """error model must be depolarizing, we need to build 4 circuits:
     1. no error/no error
@@ -301,15 +302,15 @@ def bell_sampling(g: GraphState, error_model: str, fidelity: float, shots: int):
     circ_3 = base_circ + g.get_noise_circuit(fidelity, 'fully-dephased', g.n) + bell_circ
     circ_4 = base_circ + g.get_noise_circuit(fidelity, 'fully-dephased', 0) + g.get_noise_circuit(fidelity, 'fully-dephased', g.n) + bell_circ
 
-    samples_1 = circ_1.compile_sampler().sample_bit_packed(shots)
-    samples_2 = circ_2.compile_sampler().sample_bit_packed(shots)
-    samples_3 = circ_3.compile_sampler().sample_bit_packed(shots)
-    samples_4 = circ_4.compile_sampler().sample_bit_packed(shots)
+    samples_1 = circ_1.compile_sampler(seed=seed).sample_bit_packed(shots)
+    samples_2 = circ_2.compile_sampler(seed=seed).sample_bit_packed(shots)
+    samples_3 = circ_3.compile_sampler(seed=seed).sample_bit_packed(shots)
+    samples_4 = circ_4.compile_sampler(seed=seed).sample_bit_packed(shots)
 
     N = 2 ** g.n
     p = fidelity - (1 - fidelity) / (N - 1)
 
-    samples = probabilistic_select_rows([samples_1, samples_2, samples_3, samples_4], [p**2, p * (1 - p), p * (1 - p), (1 - p)**2])
+    samples = probabilistic_select_rows([samples_1, samples_2, samples_3, samples_4], [p**2, p * (1 - p), p * (1 - p), (1 - p)**2], seed=seed)
     return samples    
 
 def expectation_value_of_observables_from_bell_bitpacked(
@@ -426,7 +427,7 @@ def _post_process_partial_tomo_generator_samples_to_all_stabilizers(g: GraphStat
     return prob_plus_one
 
 
-def _post_process_dge_for_complete_graph_overlap(g: GraphState, samples):
+def _post_process_dge_for_complete_graph_overlap(g: GraphState, samples, seed: int = None):
     """postprocess dge for complete graph state with non-overlapping stabilizer observables"""
     # since samples are bitpacked (little-endian) we count the chunks instead of the number of qubits
     shots, num_measurement_chunks = samples.shape # (M, C)
@@ -434,6 +435,7 @@ def _post_process_dge_for_complete_graph_overlap(g: GraphState, samples):
     num_groups = (
         N // 2 + 1
     )  # note here that we have N/2 (odd product of generators) + 1 (all even; i.e., all Ys)
+    rng = np.random.default_rng(seed=seed)
 
     if g.n > 64:
         raise ValueError(f"n={g.n} is too large for this optimized function (max 64).")
@@ -466,7 +468,6 @@ def _post_process_dge_for_complete_graph_overlap(g: GraphState, samples):
     # assign how many shots to each group
     sample_sizes = np.full(num_groups, shots // num_groups, dtype=int)
     left_over_shots = shots % num_groups
-    rng = np.random.default_rng()
     lucky_stabilizers = rng.choice(
         num_groups, left_over_shots, replace=False
     )  # we don't add to the same group twice
@@ -527,7 +528,7 @@ def _post_process_dge_for_complete_graph_overlap(g: GraphState, samples):
     return final_expectation_values
 
 
-def _post_process_dge_for_complete_graph_non_overlap(g: GraphState, samples):
+def _post_process_dge_for_complete_graph_non_overlap(g: GraphState, samples, seed: int = None):
     """
     New version of post-processing where even stabilizers are further
     grouped into bitwise-disjoint sets.
@@ -577,10 +578,10 @@ def _post_process_dge_for_complete_graph_non_overlap(g: GraphState, samples):
             f"Not enough shots to split between all stabilizers (shots given: {shots}; total circuits to run {num_groups})"
         )
 
+    rng = np.random.default_rng(seed=seed)
     sample_sizes = np.full(num_groups, shots // num_groups, dtype=int)
     left_over_shots = shots % num_groups
 
-    rng = np.random.default_rng()
     lucky_stabilizers = rng.choice(num_groups, left_over_shots, replace=False)
     sample_sizes[lucky_stabilizers] += 1
 
@@ -662,6 +663,7 @@ def dge_combined(
     fidelity: float,
     shots: int,
     overlap_observables: bool,
+    seed: int = None,
 ):
     """steps to perform DGE specific to ONLY complete-graph graph states
     (to get expectation values over all obsevables defined from stabilizer elements).
@@ -680,7 +682,7 @@ def dge_combined(
         circuit = g.get_graph_state_circuit(0)
         circuit += g.get_noise_circuit(fidelity, error_model, 0)
         circuit += g.get_partial_tomo_measurement_circuit()
-        samples = circuit.compile_sampler().sample_bit_packed(shots)
+        samples = circuit.compile_sampler(seed=seed).sample_bit_packed(shots)
     else:
         base_circ = g.get_graph_state_circuit(0)
         meas_circ = g.get_partial_tomo_measurement_circuit()
@@ -690,13 +692,14 @@ def dge_combined(
             base_circ + g.get_noise_circuit(fidelity, "fully-dephased", 0) + meas_circ
         )
 
-        samples_1 = circ_1.compile_sampler().sample_bit_packed(shots)
-        samples_2 = circ_2.compile_sampler().sample_bit_packed(shots)
+        samples_1 = circ_1.compile_sampler(seed=seed).sample_bit_packed(shots)
+        samples_2 = circ_2.compile_sampler(seed=seed).sample_bit_packed(shots)
 
         N = 2**g.n
         p = fidelity - (1 - fidelity) / (N - 1)
 
-        mask = np.random.rand(shots) < p
+        rng = np.random.default_rng(seed=seed)
+        mask = rng.random(shots) < p
         mask_reshaped = mask[:, np.newaxis]
         samples = np.where(mask_reshaped, samples_1, samples_2)
 
@@ -706,7 +709,7 @@ def dge_combined(
         return _post_process_dge_for_complete_graph_non_overlap(g, samples)
 
 
-def partial_tomo(g: GraphState, error_model: str, fidelity: float, shots: int):
+def partial_tomo(g: GraphState, error_model: str, fidelity: float, shots: int, seed: int = None):
     """steps to perform partial tomo (to get expectation values over all obsevables defined from stabilizer elements).
     1. create the circuit of graph state.
     2. add noise according to the given noise model and fidelity
@@ -723,7 +726,7 @@ def partial_tomo(g: GraphState, error_model: str, fidelity: float, shots: int):
         circuit += g.get_noise_circuit(fidelity, error_model, 0)
         circuit += g.get_partial_tomo_measurement_circuit()
 
-        samples = circuit.compile_sampler().sample_bit_packed(shots)
+        samples = circuit.compile_sampler(seed=seed).sample_bit_packed(shots)
         return _post_process_partial_tomo_generator_samples_to_all_stabilizers(
             g, samples
         )
@@ -741,13 +744,14 @@ def partial_tomo(g: GraphState, error_model: str, fidelity: float, shots: int):
     circ_1 = base_circ + meas_circ
     circ_2 = base_circ + g.get_noise_circuit(fidelity, "fully-dephased", 0) + meas_circ
 
-    samples_1 = circ_1.compile_sampler().sample_bit_packed(shots)
-    samples_2 = circ_2.compile_sampler().sample_bit_packed(shots)
+    samples_1 = circ_1.compile_sampler(seed=seed).sample_bit_packed(shots)
+    samples_2 = circ_2.compile_sampler(seed=seed).sample_bit_packed(shots)
 
     N = 2**g.n
     p = fidelity - (1 - fidelity) / (N - 1)
 
-    mask = np.random.rand(shots) < p
+    rng = np.random.default_rng(seed=seed)
+    mask = rng.random(shots) < p
     mask_reshaped = mask[:, np.newaxis]
     samples = np.where(mask_reshaped, samples_1, samples_2)
 
