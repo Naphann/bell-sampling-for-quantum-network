@@ -262,9 +262,12 @@ def expectation_value_of_observables(int_paulis: np.ndarray, measurement_results
     return sum(fn(measurement_results)) / len(measurement_results)
 
 
-def expectation_value_of_observables_bitpacked(
-    int_paulis: np.ndarray, measurement_results: np.ndarray
-):
+def expectation_value_of_observables_bitpacked(int_paulis: np.ndarray, measurement_results: np.ndarray):
+    # tables for eigenvalues
+    #      | Phi+ | Phi- | Psi+ | Psi- |
+    #  XX  |   1  |  -1  |   1  |  -1  |  check Z
+    #  YY  |  -1  |   1  |   1  |  -1  |  xor 00
+    #  ZZ  |   1  |   1  |  -1  |  -1  |  check X
     gn = lambda x: np.bitwise_count(np.bitwise_xor.reduce(x & int_paulis, axis=1)) % 2
     n = len(measurement_results)
     return max((n - 2.0 * np.sum(gn(measurement_results))) / n, 0)
