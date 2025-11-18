@@ -763,13 +763,10 @@ def get_diagonals_from_all_stabilizer_observables(g: GraphState, expvals):
     # Get the integer indices corresponding to the stabilizers in 'exps'
     # These indices are assumed to be 1, 2, ..., N_fwhm-1 if exps covers all non-identity Paulis
     stabilizer_integer_indices = np.arange(1, 2**g.n)
-    # sqrt_exps_safe = np.sqrt(np.maximum(0, expvals))
 
     # Populate fwht_input:
-    # fwht_input[0] remains 0 (for identity Pauli, if not included in exps)
-    # fwht_input[s] = sqrt(expectation_value_of_stabilizer_s)
     fwht_input[stabilizer_integer_indices] = expvals
-    fwht_input[0] = 1.0
+    fwht_input[0] = 1.0 # expectation values of I^n is always 1
 
     # Calculate the Fast Walsh-Hadamard Transform
     # The result 'transformed_coeffs[i]' = sum_s (fwht_input[s] * (-1)**<i,s>)
@@ -777,6 +774,5 @@ def get_diagonals_from_all_stabilizer_observables(g: GraphState, expvals):
     transformed_coeffs = np.array(fwht(fwht_input), dtype=float)
 
     # Calculate the final diagonal values
-    # diagonals = (1.0 + transformed_coeffs) / N_fwhm
     diagonals = transformed_coeffs / N_fwhm
     return diagonals
