@@ -1,7 +1,7 @@
 import numpy as np
 
 
-def probabilistic_select_rows(arrays, probabilities):
+def probabilistic_select_rows(arrays, probabilities, seed: int = None):
     """
     Selects entire rows from a list of 2D NumPy arrays based on probabilities.
 
@@ -40,7 +40,8 @@ def probabilistic_select_rows(arrays, probabilities):
 
     # 2. For each of the M rows, randomly choose an index from [0, 1, 2, 3]
     # based on the provided probabilities. This gives a 1D array of M choices.
-    choice_indices = np.random.choice(4, size=M, p=probabilities)
+    rng = np.random.default_rng(seed=seed)
+    choice_indices = rng.choice(4, size=M, p=probabilities)
 
     # 3. Use NumPy indexing to select the rows.
     # We provide the chosen array index (from choice_indices) for each row index.
