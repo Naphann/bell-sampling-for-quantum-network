@@ -1,4 +1,3 @@
-import math
 from functools import partial  # For fixing arguments to worker functions
 
 import igraph as ig
@@ -252,16 +251,6 @@ def get_true_diagonals(num_qubits: int, fidelity: float, error_model: str):
     raise ValueError(f"unknown error_model (given {error_model})")
 
 
-def expectation_value_of_observables(int_paulis: np.ndarray, measurement_results: np.ndarray):
-    # tables for eigenvalues
-    #      | Phi+ | Phi- | Psi+ | Psi- |
-    #  XX  |   1  |  -1  |   1  |  -1  |  check Z
-    #  YY  |  -1  |   1  |   1  |  -1  |  xor 00
-    #  ZZ  |   1  |   1  |  -1  |  -1  |  check X
-    fn = lambda x: np.bitwise_xor.reduce(x & int_paulis, axis=1) * -2 + 1
-    return sum(fn(measurement_results)) / len(measurement_results)
-
-
 def expectation_value_of_observables_bitpacked(int_paulis: np.ndarray, measurement_results: np.ndarray):
     # tables for eigenvalues
     #      | Phi+ | Phi- | Psi+ | Psi- |
@@ -382,53 +371,6 @@ def fidelity_estimation_via_random_sampling_parallelized(g: GraphState, num_obs:
         exps_list_results = pool.map(task_function, packed_s_tasks)
         exps = np.array(exps_list_results)
     return np.mean(np.sqrt(np.maximum(0, exps)))
-
-def _post_process_partial_tomo_generator_samples_to_all_stabilizers(g: GraphState, samples):
-    num_shots, num_chunks = samples.shape
-    N = 2 ** g.n - 1 # we have 2^n - 1 non-trivial stabilizer
-
-    num_shots_to_use = (num_shots // N) * N
-    sgr_trimmed = samples[:num_shots_to_use]
-    group_size = num_shots_to_use // N
-
-    # 1. Generate all N stabilizer masks at once.
-    # Each integer `i` from 1 to n represents a unique product of stabilizer
-    # generators. We treat `i` as a bitmask and unpack it into a byte-wise
-    # mask that aligns with the byte-packed measurement data.
-    i_vals = np.arange(1, N + 1, dtype=np.uint64)[:, np.newaxis]
-    exponents = np.arange(num_chunks, dtype=np.uint64)
-    divisors = 256**exponents
-    masks = ((i_vals // divisors) % 256).astype(sgr_trimmed.dtype)
-    # print(masks)
-
-    # 2. Reshape the measurement data into N distinct groups.
-    # Shape changes from (num_shots_to_use, num_chunks) to (n, group_size, num_chunks).
-    sgr_grouped = sgr_trimmed.reshape(N, group_size, num_chunks)
-
-    # 3. Apply the i-th mask to the i-th group using broadcasting.
-    # This `bitwise_and` operation effectively selects the measurement outcomes
-    # of the generators that are part of the i-th stabilizer product.
-    masks_reshaped = masks[:, np.newaxis, :]
-    and_results = np.bitwise_and(sgr_grouped, masks_reshaped)
-
-    # 4. Reduce the results for each shot.
-    # The `bitwise_xor.reduce` sums the selected generator outcomes (modulo 2),
-    # which gives the measurement outcome for the corresponding stabilizer product.
-    xor_results = np.bitwise_xor.reduce(and_results, axis=2)
-
-    # 5. Calculate the parity of the outcome for each shot.
-    # The parity of the number of set bits in the result corresponds to the
-    # eigenvalue: 0 for +1 (even) and 1 for -1 (odd).
-    bit_counter = np.frompyfunc(int.bit_count, 1, 1)
-    parities = bit_counter(xor_results).astype(np.int8) % 2
-    parities = parities * -2 + 1
-
-    # 6. Calculate the probability of a +1 eigenvalue for each group.
-    # This is (1 - average_parity), since average_parity is the probability of -1.
-    prob_plus_one = np.mean(parities, axis=1)
-
-    return prob_plus_one
-
 
 def _post_process_dge_for_complete_graph_overlap(g: GraphState, samples, seed: int = None):
     """postprocess dge for complete graph state with non-overlapping stabilizer observables"""
@@ -710,56 +652,6 @@ def dge_combined(
         return _post_process_dge_for_complete_graph_overlap(g, samples)
     else:
         return _post_process_dge_for_complete_graph_non_overlap(g, samples)
-
-
-def partial_tomo(g: GraphState, error_model: str, fidelity: float, shots: int, seed: int = None):
-    """steps to perform partial tomo (to get expectation values over all obsevables defined from stabilizer elements).
-    1. create the circuit of graph state.
-    2. add noise according to the given noise model and fidelity
-    3. add stabilizer generator measurement parts (we get n measurements each run)
-    4. transform these n measurements to expectation values over all observables defined from stabilizer elements.
-    5. return results.
-    """
-    # TODO: write the output format of the samples
-    _validate_error_model(error_model)
-    _validate_fidelity(fidelity)
-
-    if error_model != "depolarizing":
-        circuit = g.get_graph_state_circuit(0)
-        circuit += g.get_noise_circuit(fidelity, error_model, 0)
-        circuit += g.get_partial_tomo_measurement_circuit()
-
-        samples = circuit.compile_sampler(seed=seed).sample_bit_packed(shots)
-        return _post_process_partial_tomo_generator_samples_to_all_stabilizers(
-            g, samples
-        )
-
-    """error model must be depolarizing, we need to build 4 circuits:
-    1. no error/no error
-    2. no error/fully dephased
-    3. fully dephased/no error
-    4. fully dephased/fully dephased
-    and sample this based on the given fidelity
-    """
-    base_circ = g.get_graph_state_circuit(0)
-    meas_circ = g.get_partial_tomo_measurement_circuit()
-
-    circ_1 = base_circ + meas_circ
-    circ_2 = base_circ + g.get_noise_circuit(fidelity, "fully-dephased", 0) + meas_circ
-
-    samples_1 = circ_1.compile_sampler(seed=seed).sample_bit_packed(shots)
-    samples_2 = circ_2.compile_sampler(seed=seed).sample_bit_packed(shots)
-
-    N = 2**g.n
-    p = fidelity - (1 - fidelity) / (N - 1)
-
-    rng = np.random.default_rng(seed=seed)
-    mask = rng.random(shots) < p
-    mask_reshaped = mask[:, np.newaxis]
-    samples = np.where(mask_reshaped, samples_1, samples_2)
-
-    return _post_process_partial_tomo_generator_samples_to_all_stabilizers(g, samples)
-
 
 def get_diagonals_from_all_stabilizer_observables(g: GraphState, expvals):
     N_fwhm = 1 << g.n  # 2**n_qubits, size of the FWHT vector
