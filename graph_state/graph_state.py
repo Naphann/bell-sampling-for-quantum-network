@@ -7,7 +7,7 @@ import numpy as np
 import stim
 from sympy import fwht
 
-from graph_state.array_helper import probabilistic_select_rows, constructive_grouping
+from graph_state.array_helper import probabilistic_select_rows, constructive_disjoint_complete_graph_stabilizer_grouping
 
 
 def _validate_fidelity(fidelity: float):
@@ -429,7 +429,7 @@ def _post_process_partial_tomo_generator_samples_to_all_stabilizers(g: GraphStat
 def _post_process_dge_for_complete_graph_overlap(g: GraphState, samples):
     """postprocess dge for complete graph state with non-overlapping stabilizer observables"""
     # since samples are bitpacked (little-endian) we count the chunks instead of the number of qubits
-    shots, num_measurement_chunks = samples.shape
+    shots, num_measurement_chunks = samples.shape # (M, C)
     N = 2**g.n
     num_groups = (
         N // 2 + 1
@@ -475,7 +475,7 @@ def _post_process_dge_for_complete_graph_overlap(g: GraphState, samples):
     # 1. Split the samples into groups based on sample_sizes
     split_indices = np.cumsum(sample_sizes)[:-1]
     sample_groups = np.split(samples, split_indices, axis=0)
-    all_parities_list = []
+    odd_product_parities_list = []
 
     # 2. Process the first (num_groups - 1) groups against the odd stabilizers
     for i in range(num_groups - 1):
@@ -489,7 +489,7 @@ def _post_process_dge_for_complete_graph_overlap(g: GraphState, samples):
         total_bit_counts_per_sample = np.bitwise_count(bitwise_and_result).sum(axis=1)
         parities = (total_bit_counts_per_sample % 2).astype(np.int8)
 
-        all_parities_list.append(parities)
+        odd_product_parities_list.append(parities)
 
     # 3. Process the last group against all *even* stabilizers
     last_group_samples = sample_groups[-1]
@@ -502,19 +502,18 @@ def _post_process_dge_for_complete_graph_overlap(g: GraphState, samples):
     bitwise_and_result = s_broadcast & g_broadcast
 
     # Sum bit counts over the C dimension (chunks)
-    total_bit_counts = np.bitwise_count(bitwise_and_result).sum(axis=2)  # Shape (M, K)
+    total_bit_counts = np.bitwise_count(bitwise_and_result).sum(axis=2)  # Shape (M, K); M is number of shots; K is number of stabilizer elements
 
     # Compute the parities
-    parities_last_group = (total_bit_counts % 2).astype(np.int8)
-    all_parities_list.append(parities_last_group)
+    even_products_parities_group = (total_bit_counts % 2).astype(np.int8)
+    # all_parities_list.append(even_products_parities_group)
 
     # 4. (a) Process odd stabilizer groups (first N//2)
     exp_vals_odd = np.array(
-        [np.mean(parities * -2 + 1) for parities in all_parities_list[:-1]], dtype=float
+        [np.mean(parities * -2 + 1) for parities in odd_product_parities_list], dtype=float
     )
     #    (b) Process even stabilizer group (last one)
-    parities_last_group = all_parities_list[-1]  # Shape (M, K)
-    eigenvalues_last_group = parities_last_group * -2 + 1  # Shape (M, K)
+    eigenvalues_last_group = even_products_parities_group * -2 + 1  # Shape (M, K)
     exp_vals_even = np.mean(eigenvalues_last_group, axis=0)  # Shape (K,)
 
     # 6. Create final ordered 1D array of size (N-1)
@@ -534,7 +533,7 @@ def _post_process_dge_for_complete_graph_non_overlap(g: GraphState, samples):
     grouped into bitwise-disjoint sets.
     """
     # since samples are bitpacked (little-endian) we count the chunks instead of the number of qubits
-    shots, num_measurement_chunks = samples.shape
+    shots, num_measurement_chunks = samples.shape # shape (M, C)
     N = 2**g.n
 
     if g.n > 64:
@@ -562,8 +561,8 @@ def _post_process_dge_for_complete_graph_non_overlap(g: GraphState, samples):
     even_indices = all_indices[even_mask]
     bitpacked_evens = all_numbers_bitpacked[even_mask]  # Shape (K, C)
 
-    # We need a way to group without non-overlap stabilizer elements
-    even_groups_indices = constructive_grouping(even_indices, g.n)
+    # We group the stabilizer elements without any overlapped supports
+    even_groups_indices = constructive_disjoint_complete_graph_stabilizer_grouping(even_indices, g.n)
     num_even_groups = len(even_groups_indices)
     # Create a lookup map for index -> bitpacked array
     bitpacked_even_map = {idx: arr for idx, arr in zip(even_indices, bitpacked_evens)}

@@ -1,5 +1,6 @@
 import numpy as np
 
+
 def probabilistic_select_rows(arrays, probabilities):
     """
     Selects entire rows from a list of 2D NumPy arrays based on probabilities.
@@ -41,7 +42,7 @@ def probabilistic_select_rows(arrays, probabilities):
     # based on the provided probabilities. This gives a 1D array of M choices.
     choice_indices = np.random.choice(4, size=M, p=probabilities)
 
-    # 3. Use advanced NumPy indexing to select the rows.
+    # 3. Use NumPy indexing to select the rows.
     # We provide the chosen array index (from choice_indices) for each row index.
     # np.arange(M) provides the row indices [0, 1, ..., M-1].
     # For each i in arange(M), this selects the slice:
@@ -56,18 +57,18 @@ def _greedy_group_disjoint(even_stabilizer_indices):
     """
     Groups even stabilizers into the minimum number of disjoint groups.
     This implements a greedy graph coloring algorithm.
-    
+
     Args:
         even_stabilizer_indices (np.array): 1D array of stabilizer integers.
-    
+
     Returns:
         list[list[int]]: A list where each inner list is a group of
                          bitwise-disjoint stabilizer indices.
     """
     # Convert to a standard list to make dynamic grouping easier
     nodes = list(even_stabilizer_indices)
-    groups_indices = [] # This will store our list of groups
-    
+    groups_indices = []  # This will store our list of groups
+
     for node in nodes:
         placed = False
         # Try to place the node in an existing group
@@ -76,29 +77,48 @@ def _greedy_group_disjoint(even_stabilizer_indices):
             for member in group:
                 if (node & member) != 0:
                     is_disjoint_from_all = False
-                    break # This group won't work
-            
+                    break  # This group won't work
+
             if is_disjoint_from_all:
                 group.append(node)
                 placed = True
-                break # Node has been placed
-        
+                break  # Node has been placed
+
         # If no existing group worked, create a new one
         if not placed:
             groups_indices.append([node])
-            
+
     return groups_indices
 
-def constructive_grouping(even_stabilizer_indices, n):
-    """
-    Implements a much smarter grouping strategy based on the
-    combinatorial structure of the stabilizers, as suggested by the user.
 
-    1. Even n: Uses the optimal (k, n-k) complement pairing.
+def constructive_disjoint_complete_graph_stabilizer_grouping(even_stabilizer_indices, n):
+    """
+    Split all non-trivial stabilizer elements (N-1; not including trivial I^n; N = 2^n)
+    of "complete graph state" into groups with the following constraints.
+    
+    1. Each stabilizer element is assigned to a 'single' group
+    2. Every pair of Pauli string in the same group, P and Q, must have non-overlapped support
+        i.e., weight(P) + weight(Q) = weight(P.Q) 
+        
+    In this specific case of K_n graph, all odd product of generators have full support on the qubits,
+    thus they each form each own group (N/2) group. We then left with finding the grouping method for 
+    even product of generators. For K_n graph, any even product of generators will only have I or Y term.
+
+    Using a binary string "b" to represent a stabilizer element, where "b_j" = 1 if the generator from qubit-j
+    is selected, we can have a complete ordering for the stabilizer; e.g., b = 1001 = Y1 Y4
+    Specifically, the string b is representative of the Pauli string where 1 is Y and 0 is I.
+
+    We provide two strategies for when the number of qubits (n) is even, and when (n) is odd.
+    The following strategy is used to group the even product stabilizer elements:
+    1. Even n: Uses the optimal (k, n-k) complement pairing --- this always guarantee full support (optimal).
     2. Odd n:  Uses the k_a + k_b <= n rule to create "super-groups"
                of compatible k-values, then runs the greedy algorithm
                on those smaller, simpler sub-problems.
     """
+    # validation we assume that the input even_stabilizer_indices must be unique and have length N/2 - 1
+    N = 2 ** n
+    if len(even_stabilizer_indices) != (N//2 - 1) or len(set(even_stabilizer_indices)) != len(even_stabilizer_indices):
+        raise ValueError("Expected full even products of complete graph stabilizer elements. Partial grouping not supported.")
 
     # 1. Partition stabilizers by their bit count (k)
     k_map = {}
@@ -110,54 +130,20 @@ def constructive_grouping(even_stabilizer_indices, n):
 
     groups = []
 
-    if (n % 2 == 0):
-        # --- Strategy for even n: (k, n-k) pairing ---
-        processed_k = set()
+    if n % 2 == 0:
         all_ones = (1 << n) - 1
+        canonical_pairs = {tuple(sorted((a, all_ones ^ a))) for a in even_stabilizer_indices}
 
-        for k in sorted(k_map.keys()):
-            if k in processed_k:
-                continue
+        special_pair = (0, all_ones)
+        canonical_pairs.remove(special_pair)
+        canonical_pairs.add((all_ones,))
 
-            complement_k = n - k
-
-            if k == complement_k:
-                # Special case: k = n/2. Pair them with each other.
-                paired_nodes = set()
-                for a in k_map[k]:
-                    if a in paired_nodes:
-                        continue
-                    b = a ^ all_ones
-                    # b must also be in k_map[k] and not yet paired
-                    if b in k_map[k] and b not in paired_nodes:
-                        groups.append([a, b])
-                        paired_nodes.add(a)
-                        paired_nodes.add(b)
-                    else:
-                        # This should not happen if n/2 is even
-                        groups.append([a]) 
-                processed_k.add(k)
-
-            elif complement_k in k_map:
-                # Standard case: k and n-k are distinct.
-                # All complements are in the other k-group.
-                for a in k_map[k]:
-                    b = a ^ all_ones
-                    groups.append([a, b])
-                processed_k.add(k)
-                processed_k.add(complement_k)
-
-            else:
-                # Unpaired k-group (e.g., k=n)
-                for a in k_map[k]:
-                    groups.append([a])
-                processed_k.add(k)
-
+        groups = sorted([list(pair) for pair in canonical_pairs])
     else:
         # --- Strategy for odd n: k_a + k_b <= n "super-groups" ---
 
         # 1. Find which k-values can be grouped together.
-        super_groups_k = [] # list of lists of k-values
+        super_groups_k = []  # list of lists of k-values
         remaining_k = sorted(k_map.keys())
 
         while remaining_k:
