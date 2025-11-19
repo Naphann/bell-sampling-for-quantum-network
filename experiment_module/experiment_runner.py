@@ -1,5 +1,4 @@
 import os
-import re
 from functools import partial
 from itertools import product
 from typing import Iterable, List, Union
