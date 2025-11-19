@@ -143,7 +143,7 @@ class GraphState:
         yy = int_paulis == 3
         """
         rng = np.random.default_rng(seed=seed)
-        stabilizers = rng.rand(shots, self.n) > 0.5
+        stabilizers = rng.random((shots, self.n)) > 0.5
         return np.array(
             [
                 [
